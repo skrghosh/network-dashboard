@@ -89,4 +89,4 @@ Feel free to open issues or submit PRs to add new visualizations, alerting, pcap
 
 ## License
 
-[MIT License](LICENSE)]\(LICENSE)
+This project is licensed under the MIT License, which permits reuse, modification, and distribution with attribution. Feel free to use this code in your own projects.
