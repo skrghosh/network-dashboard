@@ -11,6 +11,8 @@ import warnings
 import logging
 from typing import Dict, List, Optional
 import socket
+from streamlit_autorefresh import st_autorefresh
+from scapy.all import sniff, conf, get_if_list
 
 
 # Configure logging
@@ -102,7 +104,11 @@ def create_visualizations(df: pd.DataFrame):
         fig_timeline = px.line(
             x=df_grouped.index,
             y=df_grouped.values,
-            title="Packets per Second"
+            title="Packets per Second",
+            labels={
+                'x': 'Time (s since start)',
+                'y': 'Packets per Second'
+            }
         )
         st.plotly_chart(fig_timeline, use_container_width=True)
 
@@ -116,34 +122,90 @@ def create_visualizations(df: pd.DataFrame):
         st.plotly_chart(fig_sources, use_container_width=True)
 
 
-def start_packet_capture():
-    """Start packet capture in a separate thread"""
+def start_packet_capture(iface: str):
     processor = PacketProcessor()
-
     def capture_packets():
-        sniff(prn=processor.process_packet, store=False)
-
-    capture_thread = threading.Thread(target=capture_packets, daemon=True)
-    capture_thread.start()
-
+        sniff(iface=iface, prn=processor.process_packet, store=False, promisc=True)
+    threading.Thread(target=capture_packets, daemon=True).start()
     return processor
+
+
+# helper to format bytes
+def format_bytes(size: int) -> str:
+    for unit in ["B","KB","MB","GB","TB"]:
+        if size < 1024:
+            return f"{size:.2f} {unit}"
+        size /= 1024
+    return f"{size:.2f} PB"
 
 
 def main():
     """Main function to run the dashboard"""
+    # auto-refresh every 2 seconds
+    st_autorefresh(interval=2_000, key="packet_refresh")
+
     st.set_page_config(page_title="Network Traffic Analysis", layout="wide")
     st.title("Real-time Network Traffic Analysis")
 
-    # Initialize packet processor in session state
-    if 'processor' not in st.session_state:
-        st.session_state.processor = start_packet_capture()
+    # 1) Auto-detect & dropdown
+    default_iface = conf.route.route("8.8.8.8")[0]
+    interfaces = get_if_list()
+    default_index = interfaces.index(default_iface) if default_iface in interfaces else 0
+    iface = st.sidebar.selectbox("📡 Capture interface", interfaces, index=default_index)
+
+    # 2) Initialize session_state.iface
+    if 'iface' not in st.session_state:
+        st.session_state.iface = iface
+
+    # 3) Detect changes
+    if iface != st.session_state.iface:
+        st.session_state.iface = iface
+        st.session_state.processor = start_packet_capture(iface)
         st.session_state.start_time = time.time()
+
+    # 4) Ensure processor exists
+    if 'processor' not in st.session_state:
+        st.session_state.processor = start_packet_capture(st.session_state.iface)
+        st.session_state.start_time = time.time()
+
+    # 5) Show which iface is active
+    st.write(f"🐾 Capturing on interface: **{st.session_state.iface}**")
 
     # Create dashboard layout
     col1, col2 = st.columns(2)
 
     # Get current data
     df = st.session_state.processor.get_dataframe()
+
+    # ——— 5-tuple flow aggregation ———
+    if not df.empty:
+        # ensure timestamp is datetime
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+
+        flow_df = (
+            df
+            .groupby(
+                ['source', 'destination', 'protocol', 'src_port', 'dst_port'],
+                as_index=False
+            )
+            .agg(
+                packet_count=('size', 'count'),
+                total_bytes=('size', 'sum'),
+                first_seen=('timestamp', 'min'),
+                last_seen=('timestamp', 'max')
+            )
+        )
+
+        # sort by most active flows
+        flow_df = flow_df.sort_values('packet_count', ascending=False)
+
+        # convert raw bytes into human-readable sizes
+        flow_df['total_size'] = flow_df['total_bytes'].apply(format_bytes)
+    else:
+        flow_df = pd.DataFrame(
+            columns=['source', 'destination', 'protocol', 'src_port', 'dst_port',
+                     'packet_count', 'total_bytes', 'first_seen', 'last_seen']
+        )
 
     # Display metrics
     with col1:
@@ -163,10 +225,24 @@ def main():
             use_container_width=True
         )
 
+    display_cols = [
+        "source", "src_port", "destination", "dst_port", "protocol",
+        "packet_count", "first_seen", "last_seen"
+    ]
+    if 'total_size' in flow_df.columns:
+        display_cols.insert(6, 'total_size')
+    st.subheader("Top Network Flows")
+    # show only the top 10
+    st.dataframe(flow_df.head(10)[display_cols], use_container_width=True)
+
     # Add refresh button
     if st.button('Refresh Data'):
         st.rerun()
 
     # Auto refresh
-    time.sleep(2)
-    st.rerun()
+    # time.sleep(5)
+    # st.rerun()
+
+
+if __name__ == "__main__":
+    main()
