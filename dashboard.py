@@ -13,6 +13,11 @@ from typing import Dict, List, Optional
 import socket
 from streamlit_autorefresh import st_autorefresh
 from scapy.all import sniff, conf, get_if_list
+from scapy.all import sniff, conf, get_if_list, ARP, IP, TCP, UDP
+from scapy.layers.dns import DNS, DNSQR
+from scapy.layers.http import HTTPRequest  # pip install scapy-http
+
+
 
 
 # Configure logging
@@ -30,7 +35,11 @@ class PacketProcessor:
         self.protocol_map = {
             1: 'ICMP',
             6: 'TCP',
-            17: 'UDP'
+            17: 'UDP',
+            'ARP': 'ARP',
+            'DNS': 'DNS',
+            'HTTP': 'HTTP',
+            'HTTPS': 'HTTPS'
         }
         self.packet_data = []
         self.start_time = datetime.now()
@@ -44,36 +53,81 @@ class PacketProcessor:
     def process_packet(self, packet) -> None:
         """Process a single packet and extract relevant information"""
         try:
+            # ————————————— ARP first —————————————
+            if ARP in packet:
+                with self.lock:
+                    pkt = packet[ARP]
+                    self.packet_data.append({
+                        'timestamp': datetime.now(),
+                        'source': pkt.psrc,
+                        'destination': pkt.pdst,
+                        'protocol': 'ARP',
+                        'size': len(packet),
+                        'time_relative': (datetime.now() - self.start_time).total_seconds(),
+                        # for ARP you could add:
+                        'hwsrc': pkt.hwsrc,
+                        'hwdst': pkt.hwdst
+                    })
+                    self.packet_count += 1
+                return  # done
+
+            # ————————— IP-layer protocols next ————————
             if IP in packet:
                 with self.lock:
-                    packet_info = {
+                    ip = packet[IP]
+                    base_proto = self.get_protocol_name(ip.proto)
+                    info = {
                         'timestamp': datetime.now(),
-                        'source': packet[IP].src,
-                        'destination': packet[IP].dst,
-                        'protocol': self.get_protocol_name(packet[IP].proto),
+                        'source': ip.src,
+                        'destination': ip.dst,
+                        'protocol': base_proto,
                         'size': len(packet),
-                        'time_relative': (datetime.now() - self.start_time).total_seconds()
+                        'time_relative': (datetime.now() - self.start_time).total_seconds(),
                     }
 
-                    # Add TCP-specific information
-                    if TCP in packet:
-                        packet_info.update({
-                            'src_port': packet[TCP].sport,
-                            'dst_port': packet[TCP].dport,
-                            'tcp_flags': packet[TCP].flags
+                    # ——— DNS (usually UDP 53, but could be TCP 53) ———
+                    if packet.haslayer(DNS) and packet.haslayer(DNSQR):
+                        dns = packet[DNSQR]
+                        info.update({
+                            'protocol': 'DNS',
+                            'dns_query': dns.qname.decode().rstrip('.')
                         })
 
-                    # Add UDP-specific information
+                    # ——— HTTP (cleartext) ———
+                    elif packet.haslayer(HTTPRequest):
+                        http = packet[HTTPRequest]
+                        info.update({
+                            'protocol': 'HTTP',
+                            'http_method': http.Method.decode(),
+                            'http_host': http.Host.decode(),
+                            'http_path': http.Path.decode()
+                        })
+
+                    # ——— HTTPS detection (encrypted, just port 443) ———
+                    elif TCP in packet and (packet[TCP].dport == 443 or packet[TCP].sport == 443):
+                        info['protocol'] = 'HTTPS'
+                        # payload is encrypted, so we won’t parse further
+
+                    # ——— TCP default ———
+                    elif TCP in packet:
+                        tcp = packet[TCP]
+                        info.update({
+                            'src_port': tcp.sport,
+                            'dst_port': tcp.dport,
+                            'tcp_flags': tcp.flags
+                        })
+
+                    # ——— UDP default ———
                     elif UDP in packet:
-                        packet_info.update({
-                            'src_port': packet[UDP].sport,
-                            'dst_port': packet[UDP].dport
+                        udp = packet[UDP]
+                        info.update({
+                            'src_port': udp.sport,
+                            'dst_port': udp.dport
                         })
 
-                    self.packet_data.append(packet_info)
+                    # append & trim
+                    self.packet_data.append(info)
                     self.packet_count += 1
-
-                    # Keep only last 10000 packets to prevent memory issues
                     if len(self.packet_data) > 10000:
                         self.packet_data.pop(0)
 
@@ -81,9 +135,24 @@ class PacketProcessor:
             logger.error(f"Error processing packet: {str(e)}")
 
     def get_dataframe(self) -> pd.DataFrame:
-        """Convert packet data to pandas DataFrame"""
+        """Convert packet data to pandas DataFrame, filling any missing columns."""
         with self.lock:
-            return pd.DataFrame(self.packet_data)
+            df = pd.DataFrame(self.packet_data)
+
+            # list all the optional keys we introduced in process_packet()
+            optional_cols = [
+                'hwsrc', 'hwdst',            # ARP
+                'dns_query',                # DNS
+                'http_method', 'http_host', 'http_path'  # HTTP
+            ]
+
+            # for each one, if it’s not in df yet, add it as a column of Nones
+            for col in optional_cols:
+                if col not in df.columns:
+                    df[col] = None
+
+            return df
+
 
 
 def create_visualizations(df: pd.DataFrame):
@@ -97,6 +166,14 @@ def create_visualizations(df: pd.DataFrame):
             title="Protocol Distribution"
         )
         st.plotly_chart(fig_protocol, use_container_width=True)
+
+        # After protocol pie:
+        fig_extra = px.bar(
+            x=protocol_counts.index,
+            y=protocol_counts.values,
+            title="All Protocol Counts"
+        )
+        st.plotly_chart(fig_extra, use_container_width=True)
 
         # Packets timeline
         df['timestamp'] = pd.to_datetime(df['timestamp'])
@@ -168,6 +245,7 @@ def main():
         st.session_state.processor = start_packet_capture(st.session_state.iface)
         st.session_state.start_time = time.time()
 
+
     # 5) Show which iface is active
     st.write(f"🐾 Capturing on interface: **{st.session_state.iface}**")
 
@@ -177,14 +255,30 @@ def main():
     # Get current data
     df = st.session_state.processor.get_dataframe()
 
-    # ——— 5-tuple flow aggregation ———
-    if not df.empty:
-        # ensure timestamp is datetime
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
+    # ——— Phase 2 widgets & filtering ———
 
+    # 1) Protocol filter (now df exists, but may be empty)
+    if not df.empty:
+        available = df['protocol'].unique().tolist()
+    else:
+        available = ['TCP', 'UDP', 'ICMP', 'OTHER']
+
+    selected_protos = st.sidebar.multiselect(
+        "✔️ Protocols",
+        available,
+        default=available
+    )
+
+    # Now apply both filters
+    if not df.empty:
+        df = df[df['protocol'].isin(selected_protos)]
+
+    # ——— 5-tuple flow aggregation ———
+    required = {'source', 'destination', 'protocol', 'src_port', 'dst_port'}
+    if not df.empty and required.issubset(df.columns):
+        # now it’s safe to groupby
         flow_df = (
-            df
-            .groupby(
+            df.groupby(
                 ['source', 'destination', 'protocol', 'src_port', 'dst_port'],
                 as_index=False
             )
@@ -195,16 +289,14 @@ def main():
                 last_seen=('timestamp', 'max')
             )
         )
-
-        # sort by most active flows
         flow_df = flow_df.sort_values('packet_count', ascending=False)
-
-        # convert raw bytes into human-readable sizes
         flow_df['total_size'] = flow_df['total_bytes'].apply(format_bytes)
     else:
         flow_df = pd.DataFrame(
-            columns=['source', 'destination', 'protocol', 'src_port', 'dst_port',
-                     'packet_count', 'total_bytes', 'first_seen', 'last_seen']
+            columns=[
+                'source', 'destination', 'protocol', 'src_port', 'dst_port',
+                'packet_count', 'total_bytes', 'first_seen', 'last_seen', 'total_size'
+            ]
         )
 
     # Display metrics
@@ -217,14 +309,6 @@ def main():
     # Display visualizations
     create_visualizations(df)
 
-    # Display recent packets
-    st.subheader("Recent Packets")
-    if len(df) > 0:
-        st.dataframe(
-            df.tail(10)[['timestamp', 'source', 'destination', 'protocol', 'size']],
-            use_container_width=True
-        )
-
     display_cols = [
         "source", "src_port", "destination", "dst_port", "protocol",
         "packet_count", "first_seen", "last_seen"
@@ -233,7 +317,14 @@ def main():
         display_cols.insert(6, 'total_size')
     st.subheader("Top Network Flows")
     # show only the top 10
-    st.dataframe(flow_df.head(10)[display_cols], use_container_width=True)
+    st.dataframe(flow_df.head(10)[display_cols], use_container_width=True, hide_index=True)
+
+    # Display recent packets
+    st.subheader("Recent Packets")
+    if len(df) > 0:
+        st.dataframe(
+            df.tail(10)[['timestamp', 'source', 'destination', 'protocol', 'size']],
+            use_container_width=True, hide_index=True)
 
     # Add refresh button
     if st.button('Refresh Data'):
